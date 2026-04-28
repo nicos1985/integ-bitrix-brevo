@@ -53,6 +53,10 @@ class TransactionalEmailLog(models.Model):
     params = models.JSONField(default=dict, blank=True)
     attachments = models.JSONField(default=list, blank=True)
 
+    # CRM entity that triggered the workflow (e.g. "deal" / "100", "contact" / "42")
+    bitrix_entity_type = models.CharField(max_length=50, null=True, blank=True)
+    bitrix_entity_id = models.CharField(max_length=50, null=True, blank=True)
+
     brevo_message_id = models.CharField(max_length=255, null=True, blank=True)
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default=STATUS_QUEUED)
 

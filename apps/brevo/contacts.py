@@ -32,7 +32,8 @@ class BrevoContactService:
         Uses updateEnabled=true so a single call handles both create and update.
         """
         email = normalize_email(contact.email)
-        attributes = self._build_attributes(contact)
+        attr_map = self.account.get_attribute_map()
+        attributes = self._build_attributes(contact, attr_map)
         payload = {
             "email": email,
             "attributes": attributes,
@@ -41,6 +42,7 @@ class BrevoContactService:
         if contact.brevo_lists:
             payload["listIds"] = [int(lid) for lid in contact.brevo_lists]
 
+        logger.info("Brevo create_or_update payload: %s", payload)
         result = self._client.request("POST", "/contacts", json=payload)
         return result or {}
 
@@ -99,20 +101,19 @@ class BrevoContactService:
     # -----------------------------------------------------------------
 
     @staticmethod
-    def _build_attributes(contact) -> dict:
+    @staticmethod
+    def _build_attributes(contact, attr_map: dict) -> dict:
         attrs: dict = {}
-        if contact.first_name:
-            attrs["FIRSTNAME"] = contact.first_name
-        if contact.last_name:
-            attrs["LASTNAME"] = contact.last_name
-        if contact.phone:
-            attrs["SMS"] = contact.phone
-        if contact.company:
-            attrs["COMPANY"] = contact.company
-        if contact.position:
-            attrs["POSITION"] = contact.position
-        if contact.source:
-            attrs["SOURCE"] = contact.source
-        if contact.bitrix_contact_id:
-            attrs["BITRIX_ID"] = contact.bitrix_contact_id
+        if contact.first_name and attr_map.get("first_name"):
+            attrs[attr_map["first_name"]] = contact.first_name
+        if contact.last_name and attr_map.get("last_name"):
+            attrs[attr_map["last_name"]] = contact.last_name
+        if contact.company and attr_map.get("company"):
+            attrs[attr_map["company"]] = contact.company
+        if contact.position and attr_map.get("position"):
+            attrs[attr_map["position"]] = contact.position
+        if contact.source and attr_map.get("source"):
+            attrs[attr_map["source"]] = contact.source
+        if contact.bitrix_contact_id and attr_map.get("bitrix_id"):
+            attrs[attr_map["bitrix_id"]] = contact.bitrix_contact_id
         return attrs

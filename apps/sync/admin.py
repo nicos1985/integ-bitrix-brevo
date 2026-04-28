@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.utils.html import format_html
 
 from apps.sync.models import IntegrationEvent, SyncedContact, SyncLog
 
@@ -19,9 +20,16 @@ class SyncedContactAdmin(admin.ModelAdmin):
     ]
     ordering = ["email"]
     readonly_fields = [
-        "sync_hash", "bitrix_updated_at", "brevo_updated_at",
+        "bitrix_updated_at", "brevo_updated_at",
         "last_synced_at", "last_sync_direction", "created_at", "updated_at",
     ]
+    actions = ["reset_sync_state"]
+
+    @admin.action(description="Reset sync state (force re-sync on next event)")
+    def reset_sync_state(self, request, queryset):
+        updated = queryset.update(sync_hash="", has_sync_error=False)
+        self.message_user(request, f"{updated} contact(s) reset — will re-sync on next Bitrix event.")
+
     fieldsets = [
         (
             "Identity",
@@ -97,6 +105,12 @@ class IntegrationEventAdmin(admin.ModelAdmin):
         "error_message", "created_at",
     ]
     date_hierarchy = "created_at"
+    actions = ["reset_to_pending", "delete_selected"]
+
+    @admin.action(description="Reset to PENDING (allows re-processing)")
+    def reset_to_pending(self, request, queryset):
+        updated = queryset.update(status="pending", error_message="", processed_at=None)
+        self.message_user(request, f"{updated} event(s) reset to PENDING.")
 
     def has_add_permission(self, request):
         return False

@@ -78,11 +78,31 @@ class BitrixPortalRegisterView(APIView):
 
 
 def _get_portal(payload: dict):
-    """Resolve a BitrixPortal from event payload (member_id or DOMAIN)."""
-    member_id = payload.get("auth", {}).get("member_id") or payload.get("member_id") or ""
-    domain = (payload.get("auth", {}).get("domain") or payload.get("DOMAIN") or "").strip().lower()
+    """
+    Resolve a BitrixPortal from event payload.
+    Bitrix24 sends auth data as flat bracket-notation keys:
+      auth[member_id], auth[domain]
+    or nested dict (auth.member_id) depending on the client used.
+    """
+    def _v(key, *fallbacks):
+        for k in (key, *fallbacks):
+            v = payload.get(k)
+            if v:
+                return (v[0] if isinstance(v, list) else v).strip()
+        return ""
+
+    member_id = _v("auth[member_id]", "member_id") or (
+        payload.get("auth", {}).get("member_id", "") if isinstance(payload.get("auth"), dict) else ""
+    )
+    domain = _v("auth[domain]", "DOMAIN", "domain") or (
+        payload.get("auth", {}).get("domain", "") if isinstance(payload.get("auth"), dict) else ""
+    )
+    domain = domain.lower()
+
     if member_id:
-        return BitrixPortal.objects.filter(member_id=member_id, is_active=True).first()
+        portal = BitrixPortal.objects.filter(member_id=member_id, is_active=True).first()
+        if portal:
+            return portal
     if domain:
         return BitrixPortal.objects.filter(domain=domain, is_active=True).first()
     return None
@@ -104,13 +124,15 @@ class BitrixInstallView(APIView):
 
     def _process(self, request):
         payload = {**request.data, **request.query_params.dict()}
+        logger.info("Bitrix install payload received: %s", payload)
         try:
             result = handle_install(payload)
             return Response(result, status=status.HTTP_200_OK)
         except ValueError as exc:
+            logger.warning("Bitrix install rejected: %s | payload: %s", exc, payload)
             return Response({"status": "error", "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
-            logger.error("Install handler error: %s", exc)
+            logger.error("Install handler error: %s | payload: %s", exc, payload)
             return Response({"status": "error", "detail": "Internal error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
@@ -124,13 +146,17 @@ class BitrixContactAddEventView(APIView):
 
     def post(self, request):
         payload = request.data if isinstance(request.data, dict) else {}
+        logger.info("contact-add payload received: %s", payload)
         portal = _get_portal(payload)
         if not portal:
             logger.warning("Bitrix contact-add: portal not found. payload keys: %s", list(payload.keys()))
             return Response({"status": "ok"})  # Return 200 so Bitrix doesn't retry indefinitely
 
+        logger.info("contact-add: portal found: %s", portal.domain)
         brevo_account = portal.tenant.brevo_accounts.filter(is_active=True).first()  # type: ignore[attr-defined]
         if not brevo_account:
+            logger.warning("contact-add: No active Brevo account for tenant %s", portal.tenant)
+            return Response({"status": "ok"})
             logger.warning("No active Brevo account for tenant %s", portal.tenant)
             return Response({"status": "ok"})
 
@@ -197,6 +223,7 @@ class BitrixWorkflowSendEmailView(APIView):
 
     def post(self, request):
         payload = request.data if isinstance(request.data, dict) else {}
+        logger.info("Workflow brevo-send-email payload: %s", payload)
         portal = _get_portal(payload)
         if not portal:
             logger.warning("Workflow brevo-send-email: portal not found.")

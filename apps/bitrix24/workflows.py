@@ -22,76 +22,76 @@ class WorkflowService:
         base_url = settings.BITRIX_APP_BASE_URL.rstrip("/")
         handler_url = f"{base_url}/api/bitrix/workflows/brevo-send-email/"
 
-        properties = [
-            {
-                "Name": "TemplateId",
+        # Bitrix24 requires PROPERTIES as a dict keyed by property name
+        properties = {
+            "TemplateId": {
+                "Name": "Template ID",
                 "Type": "int",
                 "Required": "Y",
                 "Multiple": "N",
                 "Default": "",
-                "Options": None,
             },
-            {
-                "Name": "ToEmail",
+            "ToEmail": {
+                "Name": "To Email",
                 "Type": "string",
                 "Required": "Y",
                 "Multiple": "N",
                 "Default": "",
-                "Options": None,
             },
-            {
-                "Name": "ToName",
+            "ToName": {
+                "Name": "To Name",
                 "Type": "string",
                 "Required": "N",
                 "Multiple": "N",
                 "Default": "",
-                "Options": None,
             },
-            {
-                "Name": "SenderEmail",
+            "SenderEmail": {
+                "Name": "Sender Email",
                 "Type": "string",
                 "Required": "N",
                 "Multiple": "N",
                 "Default": "",
-                "Options": None,
             },
-            {
-                "Name": "SenderName",
+            "SenderName": {
+                "Name": "Sender Name",
                 "Type": "string",
                 "Required": "N",
                 "Multiple": "N",
                 "Default": "",
-                "Options": None,
             },
-            {
-                "Name": "Params",
+            "Params": {
+                "Name": "Template Params (JSON)",
                 "Type": "text",
                 "Required": "N",
                 "Multiple": "N",
                 "Default": "{}",
-                "Options": None,
             },
-            {
-                "Name": "Attachments",
+            "Attachments": {
+                "Name": "Attachments (JSON)",
                 "Type": "text",
                 "Required": "N",
                 "Multiple": "N",
                 "Default": "[]",
-                "Options": None,
             },
-        ]
+        }
 
-        result = self._client.register_bizproc_activity(
-            code=ACTIVITY_CODE,
-            handler_url=handler_url,
-            auth_user_id=1,
-            name={"ru": "Отправить письмо Brevo", "en": "Send Brevo Email"},
-            description={
-                "ru": "Отправить транзакционное письмо через Brevo",
-                "en": "Send a transactional email via Brevo",
-            },
-            properties=properties,
-        )
+        try:
+            result = self._client.register_bizproc_activity(
+                code=ACTIVITY_CODE,
+                handler_url=handler_url,
+                auth_user_id=1,
+                name="Send Brevo Email",
+                description="Send a transactional email via Brevo",
+                properties=properties,
+            )
+        except Exception as exc:
+            # Activity already registered from a previous install — that's fine,
+            # Bitrix does not allow updating PROPERTIES via REST after creation.
+            logger.info(
+                "Bizproc activity already registered for %s, skipping: %s",
+                self.portal.domain, exc,
+            )
+            result = {"skipped": True}
         logger.info("Registered bizproc activity for portal %s", self.portal.domain)
         return result
 
@@ -106,7 +106,23 @@ class WorkflowService:
         from apps.transactional.models import TransactionalEmailLog
         from apps.sync.models import SyncedContact
 
-        properties = payload.get("PROPERTIES") or payload.get("properties") or {}
+        event_token = (
+            payload.get("event_token")
+            or payload.get("EVENT_TOKEN")
+            or ""
+        )
+
+        # Bitrix24 sends properties as bracket notation: properties[TemplateId], etc.
+        # Build a flat dict by extracting keys that start with 'properties['
+        properties: dict = payload.get("PROPERTIES") or payload.get("properties") or {}
+        if not properties or not isinstance(properties, dict) or not any(properties.values()):
+            # Parse bracket notation from the flat payload QueryDict
+            properties = {}
+            for key, val in payload.items():
+                if key.startswith("properties[") and key.endswith("]"):
+                    prop_name = key[len("properties["):-1]
+                    properties[prop_name] = val[0] if isinstance(val, list) else val
+
         template_id = int(properties.get("TemplateId") or properties.get("templateId") or 0)
         to_email = (properties.get("ToEmail") or properties.get("to_email") or "").strip()
         to_name = (properties.get("ToName") or properties.get("to_name") or "").strip() or None
@@ -126,6 +142,13 @@ class WorkflowService:
             attachments = []
 
         if not template_id or not to_email:
+            if event_token:
+                try:
+                    self._client.complete_bizproc_activity(
+                        event_token, log_message="TemplateId and ToEmail are required."
+                    )
+                except Exception:
+                    pass
             return {"status": "error", "message": "TemplateId and ToEmail are required."}
 
         # Pick default brevo account for this portal's tenant
@@ -133,11 +156,29 @@ class WorkflowService:
             BrevoAccount.objects.filter(tenant=self.portal.tenant, is_active=True).first()
         )
         if not brevo_account:
+            if event_token:
+                try:
+                    self._client.complete_bizproc_activity(
+                        event_token, log_message="No active Brevo account found for tenant."
+                    )
+                except Exception:
+                    pass
             return {"status": "error", "message": "No active Brevo account found for tenant."}
 
         sender: dict | None = None
         if sender_email:
             sender = {"email": sender_email, "name": sender_name}
+
+        # Extract CRM entity from document_id bracket-notation keys
+        # e.g. document_id[1]=CCrmDocumentDeal, document_id[2]=DEAL_100
+        def _flat(key):
+            v = payload.get(key)
+            return (v[0] if isinstance(v, list) else v or "").strip() if v else ""
+
+        doc_class = _flat("document_type[1]") or _flat("document_id[1]")
+        doc_id_str = _flat("document_id[2]")  # e.g. "DEAL_100"
+        entity_type_id = self._client._ENTITY_TYPE_IDS.get(doc_class)
+        entity_id = doc_id_str.split("_")[-1] if "_" in doc_id_str else doc_id_str
 
         log = TransactionalEmailLog.objects.create(
             tenant=self.portal.tenant,
@@ -151,6 +192,8 @@ class WorkflowService:
             params=params,
             attachments=attachments,
             status=TransactionalEmailLog.STATUS_QUEUED,
+            bitrix_entity_type=doc_class or None,
+            bitrix_entity_id=entity_id or None,
         )
 
         # Link contact if exists
@@ -184,6 +227,27 @@ class WorkflowService:
                 status=SyncLog.STATUS_SUCCESS,
                 message=f"Sent template {template_id} to {to_email}",
             )
+            if event_token:
+                try:
+                    self._client.complete_bizproc_activity(
+                        event_token,
+                        return_values={"MessageId": log.brevo_message_id or ""},
+                        log_message=f"Email sent via Brevo template {template_id}",
+                    )
+                except Exception as complete_exc:
+                    logger.warning("Could not complete bizproc activity: %s", complete_exc)
+
+            # Add timeline comment to the CRM entity
+            if entity_type_id and entity_id:
+                try:
+                    self._client.add_timeline_comment(
+                        entity_type_id,
+                        entity_id,
+                        f"Brevo: Email enviado (template {template_id} a {to_email})",
+                    )
+                except Exception as tl_exc:
+                    logger.warning("Could not add timeline comment: %s", tl_exc)
+
             return {"status": "ok", "message_id": log.brevo_message_id}
 
         except Exception as exc:
@@ -199,4 +263,11 @@ class WorkflowService:
                 status=SyncLog.STATUS_ERROR,
                 message=str(exc),
             )
+            if event_token:
+                try:
+                    self._client.complete_bizproc_activity(
+                        event_token, log_message=f"Error: {exc}"
+                    )
+                except Exception as complete_exc:
+                    logger.warning("Could not complete bizproc activity on error: %s", complete_exc)
             return {"status": "error", "message": str(exc)}

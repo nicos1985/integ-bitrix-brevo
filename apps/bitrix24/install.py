@@ -1,6 +1,8 @@
 import logging
 from datetime import datetime, timezone
 
+from django.conf import settings
+
 from apps.core.encryption import encrypt_value
 from apps.sync.models import SyncLog
 
@@ -23,12 +25,29 @@ def handle_install(payload: dict) -> dict:
     """
     from apps.bitrix24.models import BitrixPortal
 
-    domain = (payload.get("DOMAIN") or payload.get("domain") or "").strip().lower()
-    member_id = payload.get("member_id") or payload.get("MEMBER_ID") or ""
-    access_token = payload.get("AUTH_ID") or payload.get("access_token") or ""
-    refresh_token = payload.get("REFRESH_ID") or payload.get("refresh_token") or ""
-    application_token = payload.get("APP_SID") or payload.get("application_token") or ""
-    rest_endpoint = payload.get("PROTOCOL", "https") + "://" + domain + "/rest" if domain else ""
+    def _get(key, *fallbacks):
+        """
+        Extract a value from the payload handling two formats:
+        - Flat bracket notation:  payload['auth[domain]'] = ['previ.bitrix24.es']
+        - Legacy nested/flat:     payload['DOMAIN'] = 'previ.bitrix24.es'
+        Values may be lists (from QueryDict) or plain strings.
+        """
+        for k in (key, *fallbacks):
+            v = payload.get(k)
+            if v:
+                return (v[0] if isinstance(v, list) else v).strip()
+        return ""
+
+    # Bitrix24 sends auth data as flat keys with bracket notation
+    domain = _get("auth[domain]", "DOMAIN", "domain").lower()
+    member_id = _get("auth[member_id]", "member_id", "MEMBER_ID")
+    access_token = _get("auth[access_token]", "AUTH_ID", "access_token")
+    refresh_token = _get("auth[refresh_token]", "REFRESH_ID", "refresh_token")
+    application_token = _get("auth[application_token]", "APP_SID", "application_token")
+    client_endpoint = _get("auth[client_endpoint]")  # e.g. https://previ.bitrix24.es/rest/
+    rest_endpoint = client_endpoint.rstrip("/") if client_endpoint else (
+        "https://" + domain + "/rest" if domain else ""
+    )
 
     if not domain:
         raise ValueError("Missing DOMAIN in install payload.")

@@ -31,8 +31,19 @@ class SyncService:
         Process a Bitrix24 CRM contact event (onCrmContactAdd / onCrmContactUpdate).
         Idempotency is guaranteed via IntegrationEvent.dedupe_key.
         """
+        # Bitrix24 sends event payloads with flat bracket-notation keys:
+        # data[FIELDS][ID]=123  or  data[FIELDS][PREVIOUS][ID]=123
+        # but also sometimes as nested dicts depending on the client.
+        def _flat(key):
+            v = event_payload.get(key)
+            return (v[0] if isinstance(v, list) else v or "").strip() if v else ""
+
         contact_id = str(
-            event_payload.get("data", {}).get("FIELDS", {}).get("ID")
+            _flat("data[FIELDS][ID]")
+            or _flat("data[FIELDS][PREVIOUS][ID]")
+            or _flat("OBJECT_ID")
+            or _flat("ID")
+            or event_payload.get("data", {}).get("FIELDS", {}).get("ID")
             or event_payload.get("OBJECT_ID")
             or event_payload.get("ID")
             or ""
@@ -108,9 +119,9 @@ class SyncService:
         try:
             if event_type in ("unsubscribe", "hardBounce", "spam", "blocked"):
                 self._handle_brevo_unsubscribe(email, event_type, webhook_payload)
-            elif event_type in ("contact_updated", "contact_added_to_list"):
+            elif event_type in ("contactUpdated", "contact_updated", "contact_added_to_list"):
                 self._handle_brevo_contact_update(email, event_type, webhook_payload)
-            elif event_type in ("delivered", "opened", "click", "bounce"):
+            elif event_type in ("delivered", "opened", "unique_opened", "click", "bounce", "softBounce", "hardBounce"):
                 self._handle_brevo_transactional_status(email, event_type, webhook_payload)
             else:
                 logger.debug("Unhandled Brevo event type: %s", event_type)
@@ -160,11 +171,27 @@ class SyncService:
         self._map_bitrix_to_contact(bitrix_contact, contact)
 
         incoming_hash = build_contact_hash(self._contact_hashable_fields(contact))
-        if incoming_hash == contact.sync_hash and contact.last_sync_direction == SyncedContact.DIRECTION_BITRIX_TO_BREVO:
+
+        # If we just pushed this contact FROM Brevo TO Bitrix, the Bitrix event is
+        # a bounce-back of our own write (Bitrix may also inject fields like SOURCE_ID).
+        # Accept the current Bitrix state, update the hash, and skip the Brevo push.
+        if contact.last_sync_direction == SyncedContact.DIRECTION_BREVO_TO_BITRIX and not contact.has_sync_error:
+            if contact.sync_hash != incoming_hash:
+                contact.sync_hash = incoming_hash
+                contact.save(update_fields=["sync_hash", "updated_at"])
             self._log(SyncLog.SOURCE_BITRIX, SyncLog.DIRECTION_BITRIX_TO_BREVO, "contact_sync",
-                      SyncLog.STATUS_IGNORED, contact=contact, message="No field changes detected (hash match).")
+                      SyncLog.STATUS_IGNORED, contact=contact,
+                      message="Bounce-back from own Brevo→Bitrix push; skipping re-sync.")
+            logger.debug("Skipping bounce-back event for %s", email)
             return
 
+        if incoming_hash == contact.sync_hash and not contact.has_sync_error:
+            self._log(SyncLog.SOURCE_BITRIX, SyncLog.DIRECTION_BITRIX_TO_BREVO, "contact_sync",
+                      SyncLog.STATUS_IGNORED, contact=contact, message="No field changes detected (hash match).")
+            logger.debug("Skipping sync for %s — no changes", email)
+            return
+
+        logger.info("Pushing contact %s to Brevo", email)
         self._push_to_brevo(contact)
 
     def _push_to_brevo(self, contact) -> None:
@@ -186,17 +213,22 @@ class SyncService:
 
     def _push_to_bitrix(self, contact) -> None:
         bitrix_data = self._map_contact_to_bitrix(contact)
+        # Pre-save sync_hash BEFORE the external API call so that if Bitrix fires
+        # onCrmContactAdd/Update immediately, the bounce-back event sees the hash
+        # and skips the redundant Brevo push (avoids the sync loop race condition).
+        anticipated_hash = build_contact_hash(self._contact_hashable_fields(contact))
+        contact.sync_hash = anticipated_hash
+        contact.last_sync_direction = SyncedContact.DIRECTION_BREVO_TO_BITRIX
+        contact.save(update_fields=["sync_hash", "last_sync_direction", "updated_at"])
         try:
             if contact.bitrix_contact_id:
                 self._bitrix.update_contact(contact.bitrix_contact_id, bitrix_data)
             else:
                 result = self._bitrix.create_contact(bitrix_data)
                 contact.bitrix_contact_id = str(result)
-            contact.last_sync_direction = SyncedContact.DIRECTION_BREVO_TO_BITRIX
             contact.last_synced_at = datetime.now(tz=timezone.utc)
-            contact.sync_hash = build_contact_hash(self._contact_hashable_fields(contact))
             contact.has_sync_error = False
-            contact.save()
+            contact.save(update_fields=["bitrix_contact_id", "last_synced_at", "has_sync_error", "updated_at"])
             self._log(SyncLog.SOURCE_BREVO, SyncLog.DIRECTION_BREVO_TO_BITRIX, "contact_sync",
                       SyncLog.STATUS_SUCCESS, contact=contact)
         except BitrixAPIError as exc:
@@ -250,20 +282,61 @@ class SyncService:
         self._resolve_and_push(contact)
 
     def _handle_brevo_transactional_status(self, email: str, event_type: str, payload: dict) -> None:
-        """Update TransactionalEmailLog status based on Brevo transactional webhook."""
+        """Update TransactionalEmailLog status and add a Bitrix timeline comment."""
         from apps.transactional.models import TransactionalEmailLog
+        from apps.bitrix24.clients import BitrixClient
+
         message_id = payload.get("message-id") or payload.get("messageId")
         if not message_id:
             return
+
         STATUS_MAP = {
             "delivered": TransactionalEmailLog.STATUS_DELIVERED,
             "opened": TransactionalEmailLog.STATUS_OPENED,
+            "unique_opened": TransactionalEmailLog.STATUS_OPENED,
             "click": TransactionalEmailLog.STATUS_CLICKED,
             "bounce": TransactionalEmailLog.STATUS_BOUNCED,
+            "softBounce": TransactionalEmailLog.STATUS_BOUNCED,
+            "hardBounce": TransactionalEmailLog.STATUS_BOUNCED,
         }
+        COMMENT_MAP = {
+            "delivered": "Brevo: Email entregado",
+            "opened": "Brevo: Email abierto",
+            "unique_opened": "Brevo: Email abierto",
+            "click": "Brevo: Link clickeado en email",
+            "bounce": "Brevo: Email rebotado (soft bounce)",
+            "softBounce": "Brevo: Email rebotado (soft bounce)",
+            "hardBounce": "Brevo: Email rebotado definitivamente (hard bounce)",
+            "spam": "Brevo: Email marcado como spam",
+            "blocked": "Brevo: Email bloqueado por el proveedor",
+        }
+
         new_status = STATUS_MAP.get(event_type)
         if new_status:
             TransactionalEmailLog.objects.filter(brevo_message_id=message_id).update(status=new_status)
+
+        comment_text = COMMENT_MAP.get(event_type)
+        if not comment_text:
+            return
+
+        # Look up the log to get the CRM entity and template info
+        log = TransactionalEmailLog.objects.filter(brevo_message_id=message_id).first()
+        if not log or not log.bitrix_entity_type or not log.bitrix_entity_id:
+            return
+
+        from apps.bitrix24.clients import BitrixClient as _BitrixClient
+        portal = log.bitrix_portal or self.portal
+        entity_type_id = _BitrixClient._ENTITY_TYPE_IDS.get(log.bitrix_entity_type)
+        if not entity_type_id:
+            return
+
+        full_comment = f"{comment_text} (template {log.template_id} → {log.to_email})"
+        try:
+            _BitrixClient(portal).add_timeline_comment(
+                entity_type_id, log.bitrix_entity_id, full_comment
+            )
+        except Exception as exc:
+            logger.warning("Could not add Bitrix timeline comment for event %s: %s", event_type, exc)
 
     def _resolve_and_push(self, contact) -> None:
         """Apply conflict resolution: whoever was updated most recently wins."""

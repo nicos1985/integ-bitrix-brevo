@@ -71,7 +71,7 @@ class BrevoTransactionalWebhookView(APIView):
             return Response({"detail": "Unauthorized."}, status=status.HTTP_401_UNAUTHORIZED)
 
         event_type = payload.get("event") or payload.get("type") or ""
-        logger.info("Brevo transactional webhook event=%s", event_type)
+        logger.info("Brevo transactional webhook event=%s payload=%s", event_type, payload)
 
         portal = account.tenant.bitrix_portals.filter(is_active=True).first()  # type: ignore[attr-defined]
         if portal:

@@ -53,6 +53,17 @@ class BrevoAccountAdmin(admin.ModelAdmin):
             {"fields": ["default_sender_email", "default_sender_name"]},
         ),
         (
+            "Contact attribute mapping",
+            {
+                "fields": ["contact_attribute_map"],
+                "description": (
+                    "Map internal fields to the Brevo attribute names configured in this account. "
+                    "Leave empty to use defaults (FIRSTNAME, LASTNAME, COMPANY, POSITION, SOURCE, BITRIX_ID). "
+                    'Example for a Spanish account: {"first_name": "NOMBRE", "last_name": "APELLIDO", "company": "EMPRESA"}'
+                ),
+            },
+        ),
+        (
             "Webhook",
             {"fields": ["webhook_secret"], "classes": ["collapse"]},
         ),

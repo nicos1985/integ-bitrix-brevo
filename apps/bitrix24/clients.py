@@ -76,10 +76,15 @@ class BitrixClient:
                 time.sleep(retry_after)
                 continue
 
-            try:
-                resp.raise_for_status()
-            except requests.HTTPError as exc:
-                raise BitrixAPIError(f"HTTP {resp.status_code} calling {method}: {exc}") from exc
+            if not resp.ok:
+                body = ""
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = resp.text[:500]
+                raise BitrixAPIError(
+                    f"HTTP {resp.status_code} calling {method}: {body}"
+                )
 
             data = resp.json()
             if "error" in data:
@@ -141,6 +146,11 @@ class BitrixClient:
     # -----------------------------------------------------------------
 
     def register_event(self, event_name: str, handler_url: str) -> dict:
+        # Unbind first to avoid "already registered" 400 on reinstalls
+        try:
+            self.call("event.unbind", {"event": event_name, "handler": handler_url})
+        except BitrixAPIError:
+            pass  # Not bound yet — that's fine
         return self.call("event.bind", {"event": event_name, "handler": handler_url})
 
     # -----------------------------------------------------------------
@@ -166,3 +176,39 @@ class BitrixClient:
             "PROPERTIES": properties or [],
         }
         return self.call("bizproc.activity.add", params)
+
+    # Maps Bitrix24 document class names to numeric CRM entity type IDs
+    _ENTITY_TYPE_IDS = {
+        "CCrmDocumentLead": 1,
+        "CCrmDocumentDeal": 2,
+        "CCrmDocumentContact": 3,
+        "CCrmDocumentCompany": 4,
+    }
+
+    def add_timeline_comment(self, entity_type_id: int, entity_id: int | str, comment: str) -> dict:
+        """Add a comment to the timeline of a CRM entity (deal, contact, etc.)."""
+        return self.call("crm.timeline.comment.add", {
+            "fields": {
+                "ENTITY_TYPE_ID": entity_type_id,
+                "ENTITY_ID": int(entity_id),
+                "COMMENT": comment,
+            }
+        })
+
+    def complete_bizproc_activity(
+        self,
+        event_token: str,
+        return_values: dict | None = None,
+        log_message: str = "",
+    ) -> dict:
+        """Signal Bitrix24 that an async bizproc activity has finished.
+
+        Bitrix24 uses bizproc.event.send (not bizproc.activity.complete)
+        to unblock a workflow activity registered with USE_SUBSCRIPTION=Y.
+        """
+        params: dict = {"EVENT_TOKEN": event_token}
+        if return_values:
+            params["RETURN_VALUES"] = return_values
+        if log_message:
+            params["LOG_MESSAGE"] = log_message
+        return self.call("bizproc.event.send", params)
