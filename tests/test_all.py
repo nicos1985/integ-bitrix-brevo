@@ -201,15 +201,21 @@ class BrevoClientTest(TestCase):
 # ---------------------------------------------------------------
 
 class BitrixInstallTest(TestCase):
-    def test_install_creates_tenant_and_portal(self):
+    def test_install_updates_portal_tokens(self):
+        """Portal must be pre-registered; install handler only fills in OAuth tokens."""
         from unittest.mock import patch
         from apps.bitrix24.install import handle_install
+        from apps.core.encryption import decrypt_value
+
+        # Pre-register the portal (as the API would do)
+        tenant = make_tenant(slug="install-tenant")
+        portal = make_portal(tenant, domain="install-test.bitrix24.com")
 
         payload = {
             "DOMAIN": "install-test.bitrix24.com",
             "member_id": "member-abc",
-            "AUTH_ID": "access-xxx",
-            "REFRESH_ID": "refresh-yyy",
+            "AUTH_ID": "new-access-token",
+            "REFRESH_ID": "new-refresh-token",
             "PROTOCOL": "https",
         }
 
@@ -218,18 +224,24 @@ class BitrixInstallTest(TestCase):
 
         self.assertEqual(result["status"], "ok")
 
-        from apps.tenants.models import Tenant
-        from apps.bitrix24.models import BitrixPortal
-
-        self.assertTrue(Tenant.objects.filter(slug="install-test-bitrix24-com").exists())
-        portal = BitrixPortal.objects.get(domain="install-test.bitrix24.com")
+        portal.refresh_from_db()
         self.assertEqual(portal.member_id, "member-abc")
+        self.assertEqual(decrypt_value(portal.access_token_encrypted), "new-access-token")
+        self.assertEqual(decrypt_value(portal.refresh_token_encrypted), "new-refresh-token")
         self.assertTrue(portal.is_active)
+        self.assertIsNotNone(portal.installed_at)
 
     def test_install_missing_domain_raises(self):
         from apps.bitrix24.install import handle_install
         with self.assertRaises(ValueError):
             handle_install({})
+
+    def test_install_unregistered_domain_raises(self):
+        """If the portal was never pre-registered, install must raise ValueError."""
+        from unittest.mock import patch
+        from apps.bitrix24.install import handle_install
+        with self.assertRaises(ValueError, msg="Should require pre-registration"):
+            handle_install({"DOMAIN": "never-registered.bitrix24.com", "AUTH_ID": "tok"})
 
 
 # ---------------------------------------------------------------

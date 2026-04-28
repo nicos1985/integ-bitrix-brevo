@@ -1,17 +1,80 @@
 import logging
 
+from rest_framework import serializers
 from rest_framework import status
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.bitrix24.install import handle_install, handle_uninstall
 from apps.bitrix24.models import BitrixPortal
 from apps.bitrix24.workflows import WorkflowService
+from apps.core.encryption import encrypt_value
 from apps.sync.services import SyncService
 from apps.sync.models import SyncLog
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Serializer for portal pre-registration
+# ---------------------------------------------------------------------------
+
+class BitrixPortalRegisterSerializer(serializers.Serializer):
+    tenant_slug = serializers.SlugField()
+    domain = serializers.CharField(max_length=255)
+    client_id = serializers.CharField(max_length=255)
+    client_secret = serializers.CharField(max_length=255, write_only=True)
+
+    def validate_tenant_slug(self, value):
+        from apps.tenants.models import Tenant
+        try:
+            return Tenant.objects.get(slug=value)
+        except Tenant.DoesNotExist:
+            raise serializers.ValidationError(f"Tenant '{value}' not found.")
+
+    def validate_domain(self, value):
+        return value.strip().lower()
+
+
+class BitrixPortalRegisterView(APIView):
+    """
+    POST /api/bitrix/portals/
+
+    Pre-register a Bitrix24 portal before the OAuth install flow.
+    The client_id and client_secret come from the portal's Developer Resources.
+    Must be called before pointing the install URL to /api/bitrix/install/.
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request):
+        serializer = BitrixPortalRegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        tenant = data["tenant_slug"]
+        domain = data["domain"]
+
+        portal, created = BitrixPortal.objects.update_or_create(
+            domain=domain,
+            defaults={
+                "tenant": tenant,
+                "client_id": data["client_id"],
+                "client_secret_encrypted": encrypt_value(data["client_secret"]),
+                "is_active": True,
+            },
+        )
+        return Response(
+            {
+                "id": portal.pk,
+                "domain": portal.domain,
+                "tenant": tenant.slug,
+                "client_id": portal.client_id,
+                "created": created,
+                "install_url": f"/api/bitrix/install/",
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
 
 
 def _get_portal(payload: dict):

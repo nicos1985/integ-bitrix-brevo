@@ -1,8 +1,6 @@
 import logging
 from datetime import datetime, timezone
 
-from django.conf import settings
-
 from apps.core.encryption import encrypt_value
 from apps.sync.models import SyncLog
 
@@ -13,15 +11,17 @@ def handle_install(payload: dict) -> dict:
     """
     Process the Bitrix24 install payload.
 
+    Expects a BitrixPortal pre-registered in DB with the domain, tenant,
+    client_id and client_secret_encrypted already set via the
+    POST /api/bitrix/portals/ endpoint.
+
     Bitrix24 POSTs to the install handler with the following fields:
       DOMAIN, member_id, AUTH_ID (access_token), REFRESH_ID (refresh_token),
-      APP_SID (application token), AUTH_EXPIRES, access_token, refresh_token, etc.
+      APP_SID (application token), AUTH_EXPIRES.
 
     Returns a dict with {'status': 'ok'} or raises on error.
     """
-    from apps.tenants.models import Tenant
     from apps.bitrix24.models import BitrixPortal
-    from apps.bitrix24.clients import BitrixClient
 
     domain = (payload.get("DOMAIN") or payload.get("domain") or "").strip().lower()
     member_id = payload.get("member_id") or payload.get("MEMBER_ID") or ""
@@ -29,37 +29,31 @@ def handle_install(payload: dict) -> dict:
     refresh_token = payload.get("REFRESH_ID") or payload.get("refresh_token") or ""
     application_token = payload.get("APP_SID") or payload.get("application_token") or ""
     rest_endpoint = payload.get("PROTOCOL", "https") + "://" + domain + "/rest" if domain else ""
-    auth_expires = payload.get("AUTH_EXPIRES") or 3600
 
     if not domain:
         raise ValueError("Missing DOMAIN in install payload.")
 
-    # Derive tenant slug from domain, e.g. "cliente.bitrix24.com" → "cliente-bitrix24-com"
-    tenant_slug = domain.replace(".", "-")
-    tenant, _ = Tenant.objects.get_or_create(
-        slug=tenant_slug,
-        defaults={"name": domain, "is_active": True},
-    )
+    # The portal MUST have been pre-registered via POST /api/bitrix/portals/
+    # with the tenant, client_id and client_secret already set.
+    try:
+        portal = BitrixPortal.objects.get(domain=domain)
+    except BitrixPortal.DoesNotExist:
+        raise ValueError(
+            f"Portal '{domain}' not found. Register it first via POST /api/bitrix/portals/"
+        )
 
-    client_id = settings.BITRIX_APP_CLIENT_ID
-    client_secret = settings.BITRIX_APP_CLIENT_SECRET
+    # Update only the fields that come from the OAuth callback
+    portal.member_id = member_id or portal.member_id
+    portal.access_token_encrypted = encrypt_value(access_token)
+    portal.refresh_token_encrypted = encrypt_value(refresh_token)
+    portal.application_token = application_token or portal.application_token
+    portal.rest_endpoint = rest_endpoint or portal.rest_endpoint
+    portal.installed_at = datetime.now(tz=timezone.utc)
+    portal.uninstalled_at = None
+    portal.is_active = True
+    portal.save()
 
-    portal, _ = BitrixPortal.objects.update_or_create(
-        domain=domain,
-        defaults={
-            "tenant": tenant,
-            "member_id": member_id or None,
-            "client_id": client_id,
-            "client_secret_encrypted": encrypt_value(client_secret),
-            "access_token_encrypted": encrypt_value(access_token),
-            "refresh_token_encrypted": encrypt_value(refresh_token),
-            "application_token": application_token or None,
-            "rest_endpoint": rest_endpoint or None,
-            "installed_at": datetime.now(tz=timezone.utc),
-            "uninstalled_at": None,
-            "is_active": True,
-        },
-    )
+    tenant = portal.tenant
 
     # Register events and bizproc activity
     if access_token:

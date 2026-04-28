@@ -1,6 +1,7 @@
 from django.urls import path
 from apps.bitrix24.views import (
     BitrixInstallView,
+    BitrixPortalRegisterView,
     BitrixContactAddEventView,
     BitrixContactUpdateEventView,
     BitrixAppUninstallEventView,
@@ -9,6 +10,7 @@ from apps.bitrix24.views import (
 )
 
 urlpatterns = [
+    path("portals/", BitrixPortalRegisterView.as_view(), name="bitrix-portal-register"),
     path("install/", BitrixInstallView.as_view(), name="bitrix-install"),
     path("events/contact-add/", BitrixContactAddEventView.as_view(), name="bitrix-contact-add"),
     path("events/contact-update/", BitrixContactUpdateEventView.as_view(), name="bitrix-contact-update"),
